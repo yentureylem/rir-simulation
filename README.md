@@ -37,7 +37,6 @@ Model: CNN (spectrogram→spectrogram)
 Epochs: 60
 Loss: 1.72 → 1.22 (29% reduction)
 
-![Training Loss](loss_curve.png)
 
 ## 🎯 Usage
 1. **Live Demo:** [Click here](https://rir-simulation-jp8bgxwgh4xqp4uyretgcw.streamlit.app/)
