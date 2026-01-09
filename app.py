@@ -1,122 +1,69 @@
 import streamlit as st
-import pyroomacoustics as pra
 import numpy as np
-import torch
-import torch.nn as nn
 from scipy.signal import convolve
 import librosa
 import librosa.display
-import io
 import soundfile as sf
 import matplotlib.pyplot as plt
+import io
 
-# DereverbCNN model (tam)
-class DereverbCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.conv3 = nn.Conv2d(64, 1, 3, padding=1)
-        self.relu = nn.ReLU()
+# Basit Wiener filter (model yok, instant çalışır)
+def simple_dereverb(reverb_sig, rir, alpha=0.8):
+    """Wiener filter based dereverberation"""
+    # Inverse filter
+    inv_filter = np.fft.rfft(rir)
+    inv_filter = 1.0 / (np.abs(inv_filter) + 1e-8) * np.exp(-1j * np.angle(inv_filter))
     
-    def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        return self.conv3(x)
-
-# Model yükle (deploy için CPU)
-@st.cache_resource
-def load_model():
-    model = DereverbCNN()
-    model.load_state_dict(torch.load('dereverb_ultra_fast.pth', map_location='cpu'))
-    model.eval()
-    return model
-
-model = load_model()
-
-st.title("🧠 Neural Room Dereverberation Demo")
-st.markdown("**Upload any audio → AI removes room echo instantly!**")
-
-# Sidebar
-st.sidebar.header("🎛️ Controls")
-room_size = st.sidebar.slider("Room Size", 3.0, 8.0, 5.5)
-absorption = st.sidebar.slider("Reverb Amount", 0.1, 0.8, 0.4)
-
-# File upload
-uploaded_file = st.file_uploader("🎤 Upload Audio (WAV/MP3)", type=['wav','mp3','flac'])
-
-if uploaded_file is not None:
-    # Audio yükle
-    audio_bytes, sr = sf.read(uploaded_file)
-    duration = len(audio_bytes) / sr
-    st.write(f"📊 Duration: {duration:.1f}s, SR: {sr}Hz")
+    # FFT domain dereverb
+    reverb_fft = np.fft.rfft(reverb_sig)
+    dereverb_fft = reverb_fft * inv_filter[:len(reverb_fft)]
     
+    # ISTFT
+    dereverb = np.fft.irfft(dereverb_fft)
+    return np.real(dereverb)[:len(reverb_sig)]
+
+st.title("🏠 Room Impulse Response + Dereverberation")
+st.markdown("**Upload audio → RIR simulation → Echo removal**")
+
+uploaded_file = st.file_uploader("🎵 Upload Audio", type=['wav','mp3'])
+
+if uploaded_file:
+    # Load & resample
+    audio, sr = sf.read(uploaded_file)
     if sr != 16000:
-        audio_bytes = librosa.resample(audio_bytes, orig_sr=sr, target_sr=16000)
-        sr = 16000
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
     
-    # 2s chunk al
-    chunk = min(32000, len(audio_bytes))
-    clean_sig = audio_bytes[:chunk].astype(np.float32)
+    chunk = audio[:32000]  # 2s
     
+    # RIR generate (pyroomacoustics olmadan image source approx)
+    def simple_rir(length=1024, rt60=0.5):
+        t = np.arange(length)
+        rir = np.exp(-3*np.log(10)*(t/16000)/rt60) * np.random.randn(length)*0.1
+        return rir / np.max(np.abs(rir))
+    
+    rir = simple_rir()
+    reverb_sig = convolve(chunk, rir, mode='full')[:32000]
+    
+    # Dereverb
+    dereverb_sig = simple_dereverb(reverb_sig, rir)
+    
+    # Audio columns
     col1, col2, col3 = st.columns(3)
+    with col1: st.audio(chunk, sample_rate=16000)
+    with col2: st.audio(reverb_sig, sample_rate=16000) 
+    with col3: st.audio(dereverb_sig, sample_rate=16000)
     
-    # RIR + Reverb
-    with st.spinner("🎧 Simulating room reverb..."):
-        room = pra.ShoeBox([room_size]*3, fs=16000, absorption=absorption)
-        room.add_microphone([room_size/2]*3)
-        room.add_source([room_size*0.3]*3, signal=clean_sig)
-        room.compute_rir()
-        rir = room.rir[0][0]
-        
-        reverb_sig = convolve(clean_sig, rir, mode='full')
-        reverb_sig = reverb_sig[:len(clean_sig)]
+    # Plot
+    fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+    titles = ['Original', 'Reverberant', 'Dereverbed']
+    sigs = [chunk, reverb_sig, dereverb_sig]
     
-    with col1:
-        st.subheader("1. 🎵 Clean")
-        st.audio(clean_sig)
-    
-    with col2:
-        st.subheader("2. 🏠 Reverb")
-        st.audio(reverb_sig)
-    
-    # Neural dereverb
-    with col3:
-        st.subheader("3. 🧠 AI Fixed")
-        progress = st.progress(0)
-        
-        spec_transform = torch.nn.Sequential(
-            lambda x: torch.stft(x, n_fft=512, hop_length=128, win_length=512, 
-                               onesided=True, return_complex=True),
-            lambda x: torch.abs(x),
-            lambda x: torch.log(x + 1e-8)
-        )
-        
-        test_spec = spec_transform(torch.tensor(reverb_sig).float())
-        test_input = test_spec.unsqueeze(0).unsqueeze(0)
-        
-        with torch.no_grad():
-            pred_log = model(test_input)
-            pred_mag = torch.exp(pred_log.squeeze())
-            
-            # Inverse STFT
-            pred_audio = torch.istft(pred_mag, n_fft=512, hop_length=128, win_length=512,
-                                   length=len(clean_sig))
-            pred_np = pred_audio.numpy()
-            pred_np = pred_np * 0.3 / (np.max(np.abs(pred_np)) + 1e-8)
-        
-        st.audio(pred_np)
-        progress.progress(100)
-    
-    # Spectrograms
-    fig, axs = plt.subplots(1, 3, figsize=(15, 3))
-    for i, (sig, title) in enumerate([(clean_sig, 'Clean'), (reverb_sig, 'Reverb'), (pred_np, 'AI Fixed')]):
+    for i, (sig, title) in enumerate(zip(sigs, titles)):
         D = librosa.amplitude_to_db(np.abs(librosa.stft(sig)), ref=np.max)
-        librosa.display.specshow(D, y_axis='log', x_axis='time', ax=axs[i])
-        axs[i].set(title=title, xlabel='', ylabel='')
+        librosa.display.specshow(D, y_axis='log', ax=axs[i])
+        axs[i].set(title=title)
     
-    plt.suptitle('Neural Dereverberation: Echo Removal', fontsize=14)
+    plt.tight_layout()
     st.pyplot(fig)
 
-st.markdown("---")
-st.markdown("**Made with ❤️ PyTorch + Pyroomacoustics | [Colab Training](link)**")
+st.info("🚀 Neural version için local Streamlit çalıştır")
